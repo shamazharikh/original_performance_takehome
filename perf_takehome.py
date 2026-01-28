@@ -58,6 +58,10 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
+    def add_instr(self, instr):
+        """Add a complete instruction bundle (VLIW)"""
+        self.instrs.append(instr)
+
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
@@ -89,13 +93,10 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Optimized kernel: Keep data in scratch, pipeline scatter-gather with hash.
         """
         tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        
         init_vars = [
             "rounds",
             "n_nodes",
@@ -115,62 +116,249 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
+        vone = self.alloc_scratch("vone", VLEN)
+        vtwo = self.alloc_scratch("vtwo", VLEN)
+        
+        self.add("valu", ("vbroadcast", vone, one_const))
+        self.add("valu", ("vbroadcast", vtwo, two_const))
+
+        vhash_consts = []
+        vhash_multipliers = []  # For multiply_add optimization on stages 0, 2, 4
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            c1 = self.scratch_const(val1)
+            c3 = self.scratch_const(val3)
+            vc1 = self.alloc_scratch(f"vhash_c1_{hi}", VLEN)
+            vc3 = self.alloc_scratch(f"vhash_c3_{hi}", VLEN)
+            self.add("valu", ("vbroadcast", vc1, c1))
+            self.add("valu", ("vbroadcast", vc3, c3))
+            vhash_consts.append((vc1, vc3))
+            
+            # For stages where op1="+", op2="+", op3="<<", we can use multiply_add
+            # val_new = (val + const1) + (val << shift) = val * (1 + 2^shift) + const1
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                multiplier = 1 + (1 << val3)  # 1 + 2^shift
+                mult_const = self.scratch_const(multiplier)
+                vmult = self.alloc_scratch(f"vhash_mult_{hi}", VLEN)
+                self.add("valu", ("vbroadcast", vmult, mult_const))
+                vhash_multipliers.append((hi, vmult, vc1))  # (stage_idx, multiplier, addend)
+            else:
+                vhash_multipliers.append(None)
+
+        vn_nodes = self.alloc_scratch("vn_nodes", VLEN)
+        self.add("valu", ("vbroadcast", vn_nodes, self.scratch["n_nodes"]))
+        
+        vforest_p = self.alloc_scratch("vforest_p", VLEN)
+        self.add("valu", ("vbroadcast", vforest_p, self.scratch["forest_values_p"]))
+
+        n_vector_batches = batch_size // VLEN  # 32
+        
+        # Keep ALL indices and values in scratch across rounds
+        all_vidx = [self.alloc_scratch(f"all_vidx{i}", VLEN) for i in range(n_vector_batches)]
+        all_vval = [self.alloc_scratch(f"all_vval{i}", VLEN) for i in range(n_vector_batches)]
+        
+        # Temps for pipelining
+        PIPE = 4
+        vnode_val_p = [self.alloc_scratch(f"vnode_val_p{i}", VLEN) for i in range(PIPE)]
+        vtmp1_p = [self.alloc_scratch(f"vtmp1_p{i}", VLEN) for i in range(PIPE)]
+        vtmp2_p = [self.alloc_scratch(f"vtmp2_p{i}", VLEN) for i in range(PIPE)]
+        vaddr_p = [self.alloc_scratch(f"vaddr_p{i}", VLEN) for i in range(PIPE)]
+
+        # Memory address trackers
+        addr_idx = self.alloc_scratch("addr_idx")
+        addr_val = self.alloc_scratch("addr_val")
+        
+        self.add_instr({"alu": [
+            ("+", addr_idx, self.scratch["inp_indices_p"], zero_const),
+            ("+", addr_val, self.scratch["inp_values_p"], zero_const),
+        ]})
+        
+        # Load all indices and values into scratch
+        for b in range(n_vector_batches):
+            if b > 0:
+                self.add_instr({"flow": [("add_imm", addr_idx, addr_idx, VLEN)]})
+                self.add_instr({"flow": [("add_imm", addr_val, addr_val, VLEN)]})
+            self.add_instr({"load": [
+                ("vload", all_vidx[b], addr_idx),
+                ("vload", all_vval[b], addr_val),
+            ]})
+
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        round_counter = self.alloc_scratch("round_counter")
+        cond = self.alloc_scratch("cond")
+        rounds_const = self.scratch_const(rounds)
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Fully unroll rounds to eliminate loop overhead
+        for r in range(rounds):
+            A, B, C, D = 0, 1, 2, 3
+            
+            # Prologue: scatter-gather for first pair, overlap address comp for second pair
+            self.add_instr({"valu": [
+                ("+", vaddr_p[A], all_vidx[0], vforest_p),
+                ("+", vaddr_p[B], all_vidx[1], vforest_p),
+                ("+", vaddr_p[C], all_vidx[2], vforest_p),
+                ("+", vaddr_p[D], all_vidx[3], vforest_p),
+            ]})
+            # Load batches 0,1 then start loading 2,3
+            for i in range(VLEN):
+                self.add_instr({"load": [
+                    ("load_offset", vnode_val_p[A], vaddr_p[A], i),
+                    ("load_offset", vnode_val_p[B], vaddr_p[B], i),
+                ]})
+            self.add_instr({"valu": [
+                ("^", all_vval[0], all_vval[0], vnode_val_p[A]),
+                ("^", all_vval[1], all_vval[1], vnode_val_p[B]),
+            ]})
+            
+            # Steady state: hash[N] overlapped with scatter-gather[N+1]
+            for b in range(0, n_vector_batches - 2, 2):
+                next_b = b + 2
+                vidx_a, vval_a = all_vidx[b], all_vval[b]
+                vidx_b, vval_b = all_vidx[b + 1], all_vval[b + 1]
+                vidx_c, vval_c = all_vidx[next_b], all_vval[next_b]
+                vidx_d, vval_d = all_vidx[next_b + 1], all_vval[next_b + 1]
+                
+                # Hash stage 0 using multiply_add: val = val * (1 + 2^12) + const
+                # Combined with address computation for next batch
+                _, vmult0, vconst0 = vhash_multipliers[0]
+                self.add_instr({"valu": [
+                    ("multiply_add", vval_a, vval_a, vmult0, vconst0),
+                    ("multiply_add", vval_b, vval_b, vmult0, vconst0),
+                    ("+", vaddr_p[C], vidx_c, vforest_p),
+                    ("+", vaddr_p[D], vidx_d, vforest_p),
+                ]})
+                
+                # Hash stages 1-5 overlapped with scatter-gather
+                # Stages 2 and 4 use multiply_add optimization
+                load_idx = 0  # Start from load 0
+                for hi in range(1, 6):
+                    vc1, vc3 = vhash_consts[hi]
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    
+                    # Check if this stage can use multiply_add
+                    if vhash_multipliers[hi] is not None:
+                        _, vmult, vconst = vhash_multipliers[hi]
+                        instr = {"valu": [
+                            ("multiply_add", vval_a, vval_a, vmult, vconst),
+                            ("multiply_add", vval_b, vval_b, vmult, vconst),
+                        ]}
+                        # Add 2 loads since we're only using 1 cycle for this stage
+                        if load_idx < VLEN:
+                            instr["load"] = [
+                                ("load_offset", vnode_val_p[C], vaddr_p[C], load_idx),
+                                ("load_offset", vnode_val_p[D], vaddr_p[D], load_idx),
+                            ]
+                            load_idx += 1
+                        self.add_instr(instr)
+                    else:
+                        # Regular 2-cycle hash stage
+                        instr1 = {"valu": [
+                            (op1, vtmp1_p[A], vval_a, vc1),
+                            (op3, vtmp2_p[A], vval_a, vc3),
+                            (op1, vtmp1_p[B], vval_b, vc1),
+                            (op3, vtmp2_p[B], vval_b, vc3),
+                        ]}
+                        if load_idx < VLEN:
+                            instr1["load"] = [
+                                ("load_offset", vnode_val_p[C], vaddr_p[C], load_idx),
+                                ("load_offset", vnode_val_p[D], vaddr_p[D], load_idx),
+                            ]
+                            load_idx += 1
+                        self.add_instr(instr1)
+                        
+                        instr2 = {"valu": [(op2, vval_a, vtmp1_p[A], vtmp2_p[A]), (op2, vval_b, vtmp1_p[B], vtmp2_p[B])]}
+                        if load_idx < VLEN:
+                            instr2["load"] = [
+                                ("load_offset", vnode_val_p[C], vaddr_p[C], load_idx),
+                                ("load_offset", vnode_val_p[D], vaddr_p[D], load_idx),
+                            ]
+                            load_idx += 1
+                        self.add_instr(instr2)
+                
+                while load_idx < VLEN:
+                    self.add_instr({"load": [
+                        ("load_offset", vnode_val_p[C], vaddr_p[C], load_idx),
+                        ("load_offset", vnode_val_p[D], vaddr_p[D], load_idx),
+                    ]})
+                    load_idx += 1
+                
+                # Index computation + XOR for next
+                # Using multiply_add: idx = idx * 2 + (1 + (val & 1))
+                self.add_instr({"valu": [
+                    ("&", vtmp1_p[A], vval_a, vone),
+                    ("&", vtmp1_p[B], vval_b, vone),
+                    ("^", vval_c, vval_c, vnode_val_p[C]),
+                    ("^", vval_d, vval_d, vnode_val_p[D]),
+                ]})
+                # Pack ADD with address computation for next-next batch if available
+                next_next_b = next_b + 2
+                if next_next_b + 1 < n_vector_batches:
+                    self.add_instr({"valu": [
+                        ("+", vtmp1_p[A], vtmp1_p[A], vone),
+                        ("+", vtmp1_p[B], vtmp1_p[B], vone),
+                        ("+", vaddr_p[A], all_vidx[next_next_b], vforest_p),
+                        ("+", vaddr_p[B], all_vidx[next_next_b + 1], vforest_p),
+                    ]})
+                else:
+                    self.add_instr({"valu": [
+                        ("+", vtmp1_p[A], vtmp1_p[A], vone),
+                        ("+", vtmp1_p[B], vtmp1_p[B], vone),
+                    ]})
+                self.add_instr({"valu": [
+                    ("multiply_add", vidx_a, vidx_a, vtwo, vtmp1_p[A]),
+                    ("multiply_add", vidx_b, vidx_b, vtwo, vtmp1_p[B]),
+                ]})
+                self.add_instr({"valu": [
+                    ("<", vtmp1_p[A], vidx_a, vn_nodes),
+                    ("<", vtmp1_p[B], vidx_b, vn_nodes),
+                ]})
+                self.add_instr({"valu": [
+                    ("*", vidx_a, vidx_a, vtmp1_p[A]),
+                    ("*", vidx_b, vidx_b, vtmp1_p[B]),
+                ]})
+                
+                A, B, C, D = C, D, A, B
+            
+            # Epilogue: finish last batch pair
+            last_b = n_vector_batches - 2
+            vidx_a, vval_a = all_vidx[last_b], all_vval[last_b]
+            vidx_b, vval_b = all_vidx[last_b + 1], all_vval[last_b + 1]
+            
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                vc1, vc3 = vhash_consts[hi]
+                # Use multiply_add for optimizable stages
+                if vhash_multipliers[hi] is not None:
+                    _, vmult, vconst = vhash_multipliers[hi]
+                    self.add_instr({"valu": [
+                        ("multiply_add", vval_a, vval_a, vmult, vconst),
+                        ("multiply_add", vval_b, vval_b, vmult, vconst),
+                    ]})
+                else:
+                    self.add_instr({"valu": [
+                        (op1, vtmp1_p[A], vval_a, vc1),
+                        (op3, vtmp2_p[A], vval_a, vc3),
+                        (op1, vtmp1_p[B], vval_b, vc1),
+                        (op3, vtmp2_p[B], vval_b, vc3),
+                    ]})
+                    self.add_instr({"valu": [(op2, vval_a, vtmp1_p[A], vtmp2_p[A]), (op2, vval_b, vtmp1_p[B], vtmp2_p[B])]})
+            
+            # Using multiply_add: idx = idx * 2 + (1 + (val & 1))
+            self.add_instr({"valu": [
+                ("&", vtmp1_p[A], vval_a, vone),
+                ("&", vtmp1_p[B], vval_b, vone),
+            ]})
+            self.add_instr({"valu": [("+", vtmp1_p[A], vtmp1_p[A], vone), ("+", vtmp1_p[B], vtmp1_p[B], vone)]})
+            self.add_instr({"valu": [("multiply_add", vidx_a, vidx_a, vtwo, vtmp1_p[A]), ("multiply_add", vidx_b, vidx_b, vtwo, vtmp1_p[B])]})
+            self.add_instr({"valu": [("<", vtmp1_p[A], vidx_a, vn_nodes), ("<", vtmp1_p[B], vidx_b, vn_nodes)]})
+            self.add_instr({"valu": [("*", vidx_a, vidx_a, vtmp1_p[A]), ("*", vidx_b, vidx_b, vtmp1_p[B])]})
+        
+        # Store final values
+        self.add_instr({"alu": [("+", addr_val, self.scratch["inp_values_p"], zero_const)]})
+        for b in range(n_vector_batches):
+            if b > 0:
+                self.add_instr({"flow": [("add_imm", addr_val, addr_val, VLEN)]})
+            self.add_instr({"store": [("vstore", addr_val, all_vval[b])]})
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
-
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
