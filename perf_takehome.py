@@ -16,13 +16,14 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-
+from typing import Literal
 from collections import defaultdict
 import random
 import unittest
 
 from problem import (
     Engine,
+    cdiv,
     Instruction,
     DebugInfo,
     SLOT_LIMITS,
@@ -93,7 +94,25 @@ class KernelBuilder:
             ]
         }
         self.instrs.append(instr)
-        one_const = self.scratch_const(1)
+        VLEN_const = self.scratch_const(VLEN)
+        instr = {
+            "load":
+            [
+                ("const", VLEN_const, VLEN),
+            ]
+        }
+        self.instrs.append(instr)
+
+        idx_pointer = self.alloc_scratch("idx_pointer", 1)
+        value_pointer = self.alloc_scratch("value_pointer", 1)
+        instr = {
+            "load": [
+                ("const", idx_pointer, 0),
+                ("const", value_pointer, 0),
+            ]
+        }
+        self.instrs.append(instr)
+
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -102,6 +121,37 @@ class KernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
         # Any debug engine instruction is ignored by the submission simulator
         self.instrs.append({"debug": [("comment", "Starting loop")]})
+
+        #Split Batch into groups of VLEN
+        n_groups = cdiv(batch_size, VLEN)
+
+        self.group_addrs = {}
+        for i in range(n_groups):
+            self.group_addrs[i] = (
+                self.alloc_scratch(f"group_{i}_indices", VLEN),
+                self.alloc_scratch(f"group_{i}_values", VLEN),
+            )
+        #Load Input
+        for i in range(n_groups):
+            self.instrs.append(
+                {
+                "alu": [
+                    ("+", idx_pointer, idx_pointer, VLEN_const),
+                    ("+", value_pointer, value_pointer, VLEN_const),
+                ],
+                "load": [
+                    ("vload", self.group_addrs[i][0], idx_pointer),
+                    ("vload", self.group_addrs[i][1], value_pointer),
+                ]
+            }) 
+        
+
+
+
+
+
+
+        
 
     
 
