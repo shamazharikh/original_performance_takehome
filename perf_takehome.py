@@ -86,19 +86,40 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        one_const = self.scratch_const(1)
+        zero_const = self.scratch_const(0)
         instr =  {
             "load": [
                 ("vload", self.scratch["rounds"], -1),
+                ("const", zero_const, 0),
+            ]
+        }
+        self.instrs.append(instr)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+        instr = {
+            "load": [
                 ("const", one_const, 1),
+                ("const", two_const, 2),
+            ]   
+        }
+        self.instrs.append(instr)
+        #Broadcast Constants
+        one_vector = self.alloc_scratch("one_vector", VLEN)
+        two_vector = self.alloc_scratch("two_vector", VLEN)
+        instr = {
+            "valu": [
+                ("vbroadcast", one_vector, one_const),
+                ("vbroadcast", two_vector, two_const),
             ]
         }
         self.instrs.append(instr)
         VLEN_const = self.scratch_const(VLEN)
+        tmp_var = self.alloc_scratch("tmp_var", 1)
         instr = {
             "load":
             [
                 ("const", VLEN_const, VLEN),
+                ("const", tmp_var, 0),
             ]
         }
         self.instrs.append(instr)
@@ -122,6 +143,36 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.instrs.append({"debug": [("comment", "Starting loop")]})
 
+        # Load Tree Value for first three rounds(VLEN values)
+        tree_value_addrs = self.alloc_scratch("tree_values", VLEN)
+        tree_level_pointer = self.alloc_scratch("tree_level_pointer", 1)
+        instr = {
+            "load": [
+                ("vload", tree_value_addrs, self.scratch["forest_values_p"]),
+                ("const", tree_level_pointer, 0),
+            ]
+        }
+        self.instrs.append(instr)
+        for i in range(SLOT_LIMITS["valu"]):
+            self.alloc_scratch(f"valu_tmp_{i}", VLEN)
+
+        for i, (op1, val1, op2, op3, val2) in enumerate(HASH_STAGES):
+           self.alloc_scratch(f"hash_{i}_val1", VLEN)
+           self.alloc_scratch(f"hash_{i}_val2", VLEN)
+           instr = {
+            "load":[
+                ("const", self.scratch[f"hash_{i}_val1"], val1),
+                ("const", self.scratch[f"hash_{i}_val2"], val2),
+            ]
+           }
+           self.instrs.append(instr)
+           instr = {
+            "valu": [
+                ("vbroadcast", self.scratch[f"hash_{i}_val1"], self.scratch[f"hash_{i}_val1"]),
+                ("vbroadcast", self.scratch[f"hash_{i}_val2"], self.scratch[f"hash_{i}_val2"]),
+            ]   
+           }
+           self.instrs.append(instr)
         #Split Batch into groups of VLEN
         n_groups = cdiv(batch_size, VLEN)
 
@@ -130,6 +181,7 @@ class KernelBuilder:
             self.group_addrs[i] = (
                 self.alloc_scratch(f"group_{i}_indices", VLEN),
                 self.alloc_scratch(f"group_{i}_values", VLEN),
+                self.alloc_scratch(f"group_{i}_tree_values", VLEN),
             )
         #Load Input
         for i in range(n_groups):
@@ -139,23 +191,109 @@ class KernelBuilder:
                     ("+", idx_pointer, idx_pointer, VLEN_const),
                     ("+", value_pointer, value_pointer, VLEN_const),
                 ],
+                "valu":[
+                    ("vbroadcast", self.group_addrs[i][2], tree_value_addrs),
+                ],
                 "load": [
                     ("vload", self.group_addrs[i][0], idx_pointer),
                     ("vload", self.group_addrs[i][1], value_pointer),
                 ]
             }) 
-        
+        for round in range(rounds):
+            for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+                instr = {
+                    "valu": [
+                        ("^", self.group_addrs[i][1], self.group_addrs[i][1], self.group_addrs[i][2])
+                     for i in range(SLOT_LIMITS["valu"])
+                ]
+                }
+                self.instrs.append(instr)
+            # Starting Hashing
+            for (op1, val1, op2, op3, val2) in HASH_STAGES:
+                for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+                    #Hash part 1
+                    instr = {
+                        "valu": [
+                            (op3, self.scratch[f"valu_tmp_{j}"], self.group_addrs[i+j][1], self.scratch[f"hash_{j}_val2"])
+                         for j in range(SLOT_LIMITS["valu"])
+                    ]
+                    }
+                    self.instrs.append(instr)
+                    #Hash part 2
+                    instr = {
+                        "valu":[
+                            (op1, self.group_addrs[i+j][1], self.group_addrs[i+j][1], self.scratch[f"hash_{j}_val1"])
+                            for j in range(SLOT_LIMITS["valu"])
+                        ]
+                    }
+                    self.instrs.append(instr)
+                    #Hash part 3
+                    instr = {
+                        "valu": [
+                            (op2, self.group_addrs[i+j][1], self.group_addrs[i+j][1], self.scratch[f"valu_tmp_{j}"])
+                            for j in range(SLOT_LIMITS["valu"])
+                        ]
+                    }
+                    self.instrs.append(instr)
 
+            if round % 5 == 4:
+                for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+                    instr = {
+                        "valu": [
+                            ("vbroadcast", self.group_addrs[i+j][0], zero_const)
+                            for j in range(SLOT_LIMITS["valu"])
+                            ]
+                    }
+                    self.instrs.append(instr)
+                for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+                    instr= {
+                        "valu":[
+                        ("vbroadcast", self.group_addrs[i+j][2], self.scratch["forest_values_p"]) 
+                        for j in range(SLOT_LIMITS["valu"])
+                        ]
+                    }
+                    self.instrs.append(instr)
+                continue
 
+            #Find next indices
+            for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+                #2*idx + 1
+                instr = {
+                    "valu": [
+                        ("multiply_add", self.group_addrs[i+j][0], self.group_addrs[i+j][0], two_vector, one_vector)
+                     for j in range(SLOT_LIMITS["valu"])
+                    ]
+                }
+                self.instrs.append(instr)
+                # tmp = val&1
+                instr = {
+                    "valu": [
+                        ("&", self.scratch[f"valu_tmp_{j}"], self.group_addrs[i+j][1], one_vector)
+                     for j in range(SLOT_LIMITS["valu"])
+                    ]
+                }
+                self.instrs.append(instr)
+                # idx = idx + tmp
+                instr = {
+                    "valu":
+                    [
+                        ("+", self.group_addrs[i+j][0], self.group_addrs[i+j][0], self.scratch[f"valu_tmp_{j}"])
+                        for j in range(SLOT_LIMITS["valu"])
+                    ]
+                } 
+                self.instrs.append(instr)
+            #Load Tree Value
+            for i in range(n_groups):
+                for j in range(VLEN):
+                    instr = {
+                        "load": [
+                            ("load", self.group_addrs[i][2], self.scratch["forest_values_p"], j)
+                        ]
+                    }
+                    self.instrs.append(instr)
 
-
-
-
-        
-
-    
-
-        
+        #Pause
+        self.instrs.append({"flow":[("pause",)]})
 BASELINE = 147734
 
 def do_kernel_test(
