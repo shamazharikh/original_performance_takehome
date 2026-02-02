@@ -126,35 +126,22 @@ class KernelBuilder:
         #Broadcast Constants
         one_vector = self.alloc_scratch("one_vector", VLEN)
         two_vector = self.alloc_scratch("two_vector", VLEN)
+        n_nodes_vector = self.alloc_scratch("n_nodes_vector", VLEN)
+        VLEN_const = self.alloc_scratch("VLEN_const", 1)
+        tmp_var = self.alloc_scratch("tmp_var", 1)
+        idx_pointer = self.alloc_scratch("idx_pointer", 1)
+        value_pointer = self.alloc_scratch("value_pointer", 1)
         instr = {
             "valu": [
                 ("vbroadcast", one_vector, one_const),
                 ("vbroadcast", two_vector, two_const),
-            ]
-        }
-        self.instrs.append(instr)
-        n_nodes_vector = self.alloc_scratch("n_nodes_vector", VLEN)
-        instr = {
-            "valu": [
                 ("vbroadcast", n_nodes_vector, self.scratch["n_nodes"]),
-            ]
-        }
-        self.instrs.append(instr)
-        VLEN_const = self.alloc_scratch("VLEN_const", 1)
-        tmp_var = self.alloc_scratch("tmp_var", 1)
-        instr = {
+            ],
             "load":
             [
                 ("const", VLEN_const, VLEN),
                 ("const", tmp_var, 0),
-            ]
-        }
-        self.instrs.append(instr)
-
-        idx_pointer = self.alloc_scratch("idx_pointer", 1)
-        value_pointer = self.alloc_scratch("value_pointer", 1)
-        # Initialize pointers to inp_indices_p and inp_values_p
-        instr = {
+            ],
             "alu": [
                 ("+", idx_pointer, self.scratch["inp_indices_p"], zero_const),
                 ("+", value_pointer, self.scratch["inp_values_p"], zero_const),
@@ -327,7 +314,7 @@ class KernelBuilder:
             }
             self.instrs.append(instr)
             # Broadcast forest_values_p to vector (only need to do once, but doing per round is simpler)
-
+            print("Before Broadcast", len(self.instrs))
             for i in range(self.n_groups):
                 # Compute addresses: addr_tmp = forest_values_p + indices
                 instr = {
@@ -347,6 +334,7 @@ class KernelBuilder:
                             )
                     self.instrs.append({"load": load_slots})
             #Store output value
+            print("After Broadcast", len(self.instrs))
         #Store values in memory for stage matching
         instr = {
             "alu":[
@@ -384,7 +372,7 @@ def do_kernel_test(
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
-    print(mem)
+    # print(mem)
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
