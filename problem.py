@@ -134,13 +134,15 @@ class Machine:
     def print_step(self, instr, core):
         # print(core.id)
         # print(core.trace_buf)
+        # print(self.mem)
         print(self.scratch_map(core))
         print(core.pc, instr, self.rewrite_instr(instr))
 
     def scratch_map(self, core):
         res = {}
         for addr, (name, length) in self.debug_info.scratch_map.items():
-            res[name] = core.scratch[addr : addr + length]
+            if "group" in name or "tree" in name:
+                res[name] = core.scratch[addr : addr + length]
         return res
 
     def rewrite_slot(self, slot):
@@ -414,7 +416,7 @@ class Tree:
     @staticmethod
     def generate(height: int):
         n_nodes = 2 ** (height + 1) - 1
-        values = [random.randint(0, 2**30 - 1) for _ in range(n_nodes)]
+        values = [1000 + i for i in range(n_nodes)]
         return Tree(height, values)
 
 
@@ -432,7 +434,7 @@ class Input:
     @staticmethod
     def generate(forest: Tree, batch_size: int, rounds: int):
         indices = [0 for _ in range(batch_size)]
-        values = [random.randint(0, 2**30 - 1) for _ in range(batch_size)]
+        values = [random.randint(0, 2**5 - 1) for _ in range(batch_size)]
         return Input(indices, values, rounds)
 
 
@@ -488,11 +490,13 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
     """
     Build a flat memory image of the problem.
     """
-    header = 7
+    header = 8
     extra_room = len(t.values) + len(inp.indices) * 2 + VLEN * 2 + 32
+    # print(extra_room)
     mem = [0] * (
         header + len(t.values) + len(inp.indices) + len(inp.values) + extra_room
     )
+    assert len(mem) == (header + len(t.values) + len(inp.indices) + len(inp.values) + extra_room)
     forest_values_p = header
     inp_indices_p = forest_values_p + len(t.values)
     inp_values_p = inp_indices_p + len(inp.values)
@@ -509,7 +513,7 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
 
     mem[header:inp_indices_p] = t.values
     mem[inp_indices_p:inp_values_p] = inp.indices
-    mem[inp_values_p:] = inp.values
+    mem[inp_values_p:inp_values_p + len(inp.values)] = inp.values
     return mem
 
 
@@ -554,6 +558,8 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             trace[(h, i, "val")] = val
             node_val = mem[forest_values_p + idx]
             trace[(h, i, "node_val")] = node_val
+            mem[inp_values_p + i] = (val ^ node_val) % (2**32)
+            trace[(h, i, "val_after_xor")] = mem[inp_values_p + i]
             val = myhash_traced(val ^ node_val, trace, h, i)
             trace[(h, i, "hashed_val")] = val
             idx = 2 * idx + (1 if val % 2 == 0 else 2)
@@ -562,6 +568,7 @@ def reference_kernel2(mem: list[int], trace: dict[Any, int] = {}):
             trace[(h, i, "wrapped_idx")] = idx
             mem[inp_values_p + i] = val
             mem[inp_indices_p + i] = idx
+        # yield mem
     # You can add new yields or move this around for debugging
     # as long as it's matched by pause instructions.
     # The submission tests evaluate only on final memory.

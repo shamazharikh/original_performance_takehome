@@ -66,6 +66,26 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def store(self):
+        instr = {
+                "alu": [
+                    ("+", self.scratch["store_addr"], self.scratch["inp_values_p"], self.zero_const),
+                ]
+            }
+        self.instrs.append(instr)
+            
+        for i in range(self.n_groups):
+                # Store values to mem[store_addr]
+            instr = {
+                "store": [
+                    ("vstore", self.scratch["store_addr"], self.group_addrs[i][1]),
+                ],
+                "alu": [
+                    ("+", self.scratch["store_addr"], self.scratch["store_addr"], self.VLEN_const),  # Increment for next group
+                ]
+            }
+            self.instrs.append(instr)
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -86,7 +106,7 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        zero_const = self.scratch_const(0)
+        zero_const = self.alloc_scratch("zero_const", 1)
         instr =  {
             "load": [
                 ("vload", self.scratch["rounds"], -1),
@@ -94,8 +114,8 @@ class KernelBuilder:
             ]
         }
         self.instrs.append(instr)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        one_const = self.alloc_scratch("one_const", 1)
+        two_const = self.alloc_scratch("two_const", 1)
         instr = {
             "load": [
                 ("const", one_const, 1),
@@ -113,7 +133,14 @@ class KernelBuilder:
             ]
         }
         self.instrs.append(instr)
-        VLEN_const = self.scratch_const(VLEN)
+        n_nodes_vector = self.alloc_scratch("n_nodes_vector", VLEN)
+        instr = {
+            "valu": [
+                ("vbroadcast", n_nodes_vector, self.scratch["n_nodes"]),
+            ]
+        }
+        self.instrs.append(instr)
+        VLEN_const = self.alloc_scratch("VLEN_const", 1)
         tmp_var = self.alloc_scratch("tmp_var", 1)
         instr = {
             "load":
@@ -126,10 +153,11 @@ class KernelBuilder:
 
         idx_pointer = self.alloc_scratch("idx_pointer", 1)
         value_pointer = self.alloc_scratch("value_pointer", 1)
+        # Initialize pointers to inp_indices_p and inp_values_p
         instr = {
-            "load": [
-                ("const", idx_pointer, 0),
-                ("const", value_pointer, 0),
+            "alu": [
+                ("+", idx_pointer, self.scratch["inp_indices_p"], zero_const),
+                ("+", value_pointer, self.scratch["inp_values_p"], zero_const),
             ]
         }
         self.instrs.append(instr)
@@ -150,6 +178,15 @@ class KernelBuilder:
             "load": [
                 ("vload", tree_value_addrs, self.scratch["forest_values_p"]),
                 ("const", tree_level_pointer, 0),
+            ]
+        }
+        self.instrs.append(instr)
+        addr_tmp = self.alloc_scratch("addr_tmp", VLEN)
+        forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
+        instr = {
+            "valu": [
+                ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
+                ("-", addr_tmp, one_vector, one_vector)
             ]
         }
         self.instrs.append(instr)
@@ -174,17 +211,16 @@ class KernelBuilder:
            }
            self.instrs.append(instr)
         #Split Batch into groups of VLEN
-        n_groups = cdiv(batch_size, VLEN)
-
+        self.n_groups = cdiv(batch_size, VLEN)
         self.group_addrs = {}
-        for i in range(n_groups):
+        for i in range(self.n_groups):
             self.group_addrs[i] = (
                 self.alloc_scratch(f"group_{i}_indices", VLEN),
                 self.alloc_scratch(f"group_{i}_values", VLEN),
                 self.alloc_scratch(f"group_{i}_tree_values", VLEN),
             )
         #Load Input
-        for i in range(n_groups):
+        for i in range(self.n_groups):
             self.instrs.append(
                 {
                 "alu": [
@@ -200,30 +236,30 @@ class KernelBuilder:
                 ]
             }) 
         for round in range(rounds):
-            for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+            for i in range(0, self.n_groups, SLOT_LIMITS["valu"]):
                 instr = {
                     "valu": [
-                        ("^", self.group_addrs[i][1], self.group_addrs[i][1], self.group_addrs[i][2])
-                     for i in range(SLOT_LIMITS["valu"])
+                        ("^", self.group_addrs[i+j][1], self.group_addrs[i+j][1], self.group_addrs[i+j][2])
+                     for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
                 ]
                 }
                 self.instrs.append(instr)
             # Starting Hashing
-            for (op1, val1, op2, op3, val2) in HASH_STAGES:
-                for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+            for hash_stage_idx, (op1, _, op2, op3, _) in enumerate(HASH_STAGES):
+                for i in range(0, self.n_groups, SLOT_LIMITS["valu"]):
                     #Hash part 1
                     instr = {
                         "valu": [
-                            (op3, self.scratch[f"valu_tmp_{j}"], self.group_addrs[i+j][1], self.scratch[f"hash_{j}_val2"])
-                         for j in range(SLOT_LIMITS["valu"])
-                    ]
+                            (op3, self.scratch[f"valu_tmp_{j}"], self.group_addrs[i+j][1], self.scratch[f"hash_{hash_stage_idx}_val2"])
+                         for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
+                         ]
                     }
                     self.instrs.append(instr)
                     #Hash part 2
                     instr = {
                         "valu":[
-                            (op1, self.group_addrs[i+j][1], self.group_addrs[i+j][1], self.scratch[f"hash_{j}_val1"])
-                            for j in range(SLOT_LIMITS["valu"])
+                            (op1, self.group_addrs[i+j][1], self.group_addrs[i+j][1], self.scratch[f"hash_{hash_stage_idx}_val1"])
+                            for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
                         ]
                     }
                     self.instrs.append(instr)
@@ -231,37 +267,18 @@ class KernelBuilder:
                     instr = {
                         "valu": [
                             (op2, self.group_addrs[i+j][1], self.group_addrs[i+j][1], self.scratch[f"valu_tmp_{j}"])
-                            for j in range(SLOT_LIMITS["valu"])
+                            for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
                         ]
                     }
                     self.instrs.append(instr)
-
-            if round % 5 == 4:
-                for i in range(n_groups, step=SLOT_LIMITS["valu"]):
-                    instr = {
-                        "valu": [
-                            ("vbroadcast", self.group_addrs[i+j][0], zero_const)
-                            for j in range(SLOT_LIMITS["valu"])
-                            ]
-                    }
-                    self.instrs.append(instr)
-                for i in range(n_groups, step=SLOT_LIMITS["valu"]):
-                    instr= {
-                        "valu":[
-                        ("vbroadcast", self.group_addrs[i+j][2], self.scratch["forest_values_p"]) 
-                        for j in range(SLOT_LIMITS["valu"])
-                        ]
-                    }
-                    self.instrs.append(instr)
-                continue
 
             #Find next indices
-            for i in range(n_groups, step=SLOT_LIMITS["valu"]):
+            for i in range(0, self.n_groups, SLOT_LIMITS["valu"]):
                 #2*idx + 1
                 instr = {
                     "valu": [
                         ("multiply_add", self.group_addrs[i+j][0], self.group_addrs[i+j][0], two_vector, one_vector)
-                     for j in range(SLOT_LIMITS["valu"])
+                     for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
                     ]
                 }
                 self.instrs.append(instr)
@@ -269,7 +286,7 @@ class KernelBuilder:
                 instr = {
                     "valu": [
                         ("&", self.scratch[f"valu_tmp_{j}"], self.group_addrs[i+j][1], one_vector)
-                     for j in range(SLOT_LIMITS["valu"])
+                     for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
                     ]
                 }
                 self.instrs.append(instr)
@@ -278,20 +295,78 @@ class KernelBuilder:
                     "valu":
                     [
                         ("+", self.group_addrs[i+j][0], self.group_addrs[i+j][0], self.scratch[f"valu_tmp_{j}"])
-                        for j in range(SLOT_LIMITS["valu"])
+                        for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
                     ]
                 } 
                 self.instrs.append(instr)
-            #Load Tree Value
-            for i in range(n_groups):
-                for j in range(VLEN):
-                    instr = {
-                        "load": [
-                            ("load", self.group_addrs[i][2], self.scratch["forest_values_p"], j)
-                        ]
-                    }
-                    self.instrs.append(instr)
+                # wrap to zero in greater than number of tree values
+                # tmp = idx < n_nodes
+                # idx  = idx * tmp
+                instr = {
+                    "valu": [
+                        ("<", self.scratch[f"valu_tmp_{j}"], self.group_addrs[i+j][0], n_nodes_vector)
+                     for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
+                    ]
+                }
+                self.instrs.append(instr)
+                instr = {
+                    "valu": [
+                        ("*", self.group_addrs[i+j][0], self.group_addrs[i+j][0], self.scratch[f"valu_tmp_{j}"])
+                     for j in range(SLOT_LIMITS["valu"]) if i + j < self.n_groups
+                    ]
+                }
+                self.instrs.append(instr)
+            # self.instrs.append({"flow":[("pause",)]})
+            # Load Tree Value for all groups
+            # First, compute addresses: forest_values_p + indices for each group
+            # We need a temp vector to hold the computed addresses
+            instr = {
+                "valu": [
+                    ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
+                ]
+            }
+            self.instrs.append(instr)
+            # Broadcast forest_values_p to vector (only need to do once, but doing per round is simpler)
 
+            for i in range(self.n_groups):
+                # Compute addresses: addr_tmp = forest_values_p + indices
+                instr = {
+                    "valu": [
+                        ("+", addr_tmp, forest_values_p_vec, self.group_addrs[i][0]),
+                    ]
+                }
+                self.instrs.append(instr)
+                
+                # Load tree values using load_offset (2 loads per cycle)
+                for j in range(0, VLEN, SLOT_LIMITS["load"]):
+                    load_slots = []
+                    for k in range(SLOT_LIMITS["load"]):
+                        if j + k < VLEN:
+                            load_slots.append(
+                                ("load_offset", self.group_addrs[i][2], addr_tmp, j + k)
+                            )
+                    self.instrs.append({"load": load_slots})
+            #Store output value
+        #Store values in memory for stage matching
+        instr = {
+            "alu":[
+                ("+", value_pointer, self.scratch["inp_values_p"], zero_const),
+                ("+", idx_pointer, self.scratch["inp_indices_p"], zero_const)
+            ]
+        }
+        self.instrs.append(instr)
+        for i in range(self.n_groups):
+            instr = {
+                "alu":[
+                    ("+", value_pointer, value_pointer, VLEN_const),
+                    ("+", idx_pointer, idx_pointer, VLEN_const)
+                ],
+                "store": [
+                    ("vstore", value_pointer, self.group_addrs[i][1]),
+                    ("vstore", idx_pointer, self.group_addrs[i][0])
+                ]
+            }
+            self.instrs.append(instr)
         #Pause
         self.instrs.append({"flow":[("pause",)]})
 BASELINE = 147734
@@ -309,6 +384,7 @@ def do_kernel_test(
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
+    print(mem)
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
@@ -333,7 +409,7 @@ def do_kernel_test(
         assert (
             machine.mem[inp_values_p : inp_values_p + len(inp.values)]
             == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
+        ), f"Incorrect result on round {i}, {machine.mem[inp_values_p : inp_values_p + len(inp.values)]} != {ref_mem[inp_values_p : inp_values_p + len(inp.values)]}"
         inp_indices_p = ref_mem[5]
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
@@ -354,17 +430,17 @@ class Tests(unittest.TestCase):
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
-            inp = Input.generate(f, 10, 6)
+            inp = Input.generate(f, 16, 6)
             mem = build_mem_image(f, inp)
             reference_kernel(f, inp)
             for _ in reference_kernel2(mem, {}):
                 pass
-            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)]
-            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
+            assert inp.indices == mem[mem[5] : mem[5] + len(inp.indices)], f"{inp.indices} != {mem[mem[5] : mem[5] + len(inp.indices)]}"
+            assert inp.values == mem[mem[6] : mem[6] + len(inp.values)], f"{inp.values} != {mem[mem[6] : mem[6] + len(inp.values)]}"
 
     def test_kernel_trace(self):
         # Full-scale example for performance testing
-        do_kernel_test(10, 16, 256, trace=True, prints=False)
+        do_kernel_test(10, 16, 256, trace=False, prints=False)
 
     # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
     # You can uncomment this if you think it might help you debug
