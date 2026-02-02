@@ -303,36 +303,41 @@ class KernelBuilder:
                     ]
                 }
                 self.instrs.append(instr)
-            # self.instrs.append({"flow":[("pause",)]})
-            # Load Tree Value for all groups
-            # First, compute addresses: forest_values_p + indices for each group
-            # We need a temp vector to hold the computed addresses
-            instr = {
-                "valu": [
-                    ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
-                ]
-            }
-            self.instrs.append(instr)
-            # Broadcast forest_values_p to vector (only need to do once, but doing per round is simpler)
-            print("Before Broadcast", len(self.instrs))
-            for i in range(self.n_groups):
-                # Compute addresses: addr_tmp = forest_values_p + indices
-                instr = {
-                    "valu": [
-                        ("+", addr_tmp, forest_values_p_vec, self.group_addrs[i][0]),
-                    ]
-                }
-                self.instrs.append(instr)
+            # Load Tree Value for all groups - OPTIMIZED
+            # Use multiple address buffers to pipeline address computation with loads
+            # We have 6 valu slots and 2 load slots per cycle
+            
+            N_ADDR_BUFS = SLOT_LIMITS["valu"]  # 6 address buffers
+            LOADS_PER_CYCLE = SLOT_LIMITS["load"]  # 2
+            
+            # Allocate address buffers once (outside rounds loop would be better, but kept here for clarity)
+            if round == 0:
+                self.addr_bufs = [self.alloc_scratch(f"addr_buf_{b}", VLEN) for b in range(N_ADDR_BUFS)]
+            print("Before Address Computation", len(self.instrs))
+            # Process groups in batches of N_ADDR_BUFS
+            for batch_start in range(0, self.n_groups, N_ADDR_BUFS):
+                batch_end = min(batch_start + N_ADDR_BUFS, self.n_groups)
+                batch_size = batch_end - batch_start
                 
-                # Load tree values using load_offset (2 loads per cycle)
-                for j in range(0, VLEN, SLOT_LIMITS["load"]):
-                    load_slots = []
-                    for k in range(SLOT_LIMITS["load"]):
-                        if j + k < VLEN:
-                            load_slots.append(
-                                ("load_offset", self.group_addrs[i][2], addr_tmp, j + k)
-                            )
-                    self.instrs.append({"load": load_slots})
+                # Compute addresses for entire batch in one cycle (up to 6 valu ops)
+                valu_ops = []
+                for b in range(batch_size):
+                    group_idx = batch_start + b
+                    valu_ops.append(("+", self.addr_bufs[b], forest_values_p_vec, self.group_addrs[group_idx][0]))
+                self.instrs.append({"valu": valu_ops})
+                
+                # Load tree values for all groups in batch
+                # Interleave loads from different groups to maximize throughput
+                for offset in range(0, VLEN, LOADS_PER_CYCLE):
+                    for b in range(batch_size):
+                        group_idx = batch_start + b
+                        load_slots = []
+                        for k in range(LOADS_PER_CYCLE):
+                            if offset + k < VLEN:
+                                load_slots.append(
+                                    ("load_offset", self.group_addrs[group_idx][2], self.addr_bufs[b], offset + k)
+                                )
+                        self.instrs.append({"load": load_slots})
             #Store output value
             print("After Broadcast", len(self.instrs))
         #Store values in memory for stage matching
